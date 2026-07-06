@@ -50,7 +50,7 @@ async def ask_ai(ctx, *, prompt: str):
         async with ctx.typing():
             try:
                 response = await ai_client.chat.completions.create(
-                    model="Qwen/Qwen2.5-3B-Instruct-GGUF", 
+                    model="local-model",
                     messages=[
                         {"role": "system", "content": "You are Lucy, a helpful and witty AI assistant."},
                         {"role": "user", "content": prompt}
