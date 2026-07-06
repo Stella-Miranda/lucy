@@ -1,10 +1,28 @@
 import os
 import sys
-import asyncio  # 1. Imported asyncio to use Lock
+import asyncio
+import threading
+from flask import Flask  # Added Flask back to trick Render's port scanner
 import discord
 from discord.ext import commands
 from openai import AsyncOpenAI
 
+# 1. DUMMY WEB SERVER FOR RENDER FREE TIER
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_flask():
+    # Render automatically passes a PORT environment variable, defaults to 10000
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# Start the web server in a separate background thread
+threading.Thread(target=run_flask, daemon=True).start()
+
+# 2. DISCORD BOT LOGIC
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 HF_SPACE_URL = os.getenv('HF_SPACE_URL') 
 
@@ -17,21 +35,17 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 2. CREATE THE LOCK HERE
-# This lock ensures only one request hits the model at any given millisecond
 ai_lock = asyncio.Lock()
 
 @bot.event
 async def on_ready():
-    print(f"Lucy is live on Render and queue system is active!")
+    print(f"Lucy is live on Render Web Service Free Tier!")
 
 @bot.command(name="ai")
 async def ask_ai(ctx, *, prompt: str):
-    # 3. Check if the bot is currently busy to give user feedback
     if ai_lock.locked():
         await ctx.send("⏳ I'm currently thinking for someone else. You've been placed in the queue!")
 
-    # 4. Acquire the lock. If someone else is using it, this waits here.
     async with ai_lock:
         async with ctx.typing():
             try:
@@ -48,8 +62,6 @@ async def ask_ai(ctx, *, prompt: str):
             except Exception as e:
                 await ctx.send("Lucy is having trouble thinking right now.")
                 print(f"Error: {e}")
-    # 5. The lock is automatically released here when the 'async with' block ends,
-    # allowing the next user in line to go.
 
 if not DISCORD_TOKEN or not HF_SPACE_URL:
     print("CRITICAL ERROR: Missing environment variables!")
