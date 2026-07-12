@@ -280,23 +280,23 @@ async def on_message(message):
 
     # Check if the message is in a DM
     if message.guild is None:
-        # If they did NOT use the prefix in a DM, intercept it and run directly
         if not message.content.startswith("!ai"):
             ctx = await bot.get_context(message)
             
-            # Fetch the last 8 messages to build recent rolling context
             recent_messages = []
+            # Grab history, but skip the very last message (the current one) 
+            # by checking the message ID so we don't duplicate it.
             async for msg in message.channel.history(limit=8, oldest_first=True):
+                if msg.id == message.id:
+                    continue
                 role = "assistant" if msg.author == bot.user else "user"
                 content = msg.content.replace("!ai ", "") if msg.content.startswith("!ai ") else msg.content
                 if content:
                     recent_messages.append({"role": role, "content": content})
 
-            # Explicitly call the function directly, bypassing the prefix engine
             await ask_ai(ctx, prompt=message.content, chat_history=recent_messages)
             return
 
-    # Process standard commands (!ai hello) in public servers
     await bot.process_commands(message)
 
 
@@ -327,11 +327,10 @@ async def ask_ai(ctx, *, prompt: str, chat_history: list = None):
                 messages_payload = [{"role": "system", "content": system_instruction}]
 
                 if chat_history:
-                    # Append chronological context (including the latest message scraped at the tail end)
                     messages_payload.extend(chat_history)
-                else:
-                    # Direct standard trigger fallback
-                    messages_payload.append({"role": "user", "content": prompt})
+                
+                # ALWAYS append the fresh incoming prompt at the very end so the LLM knows what to reply to!
+                messages_payload.append({"role": "user", "content": prompt})
 
                 # 3. Call execution model
                 response = await ai_client.chat.completions.create(
