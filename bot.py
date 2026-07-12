@@ -2,45 +2,76 @@ import os
 import sys
 import asyncio
 import threading
-from flask import Flask  # Added Flask back to trick Render's port scanner
+from flask import Flask
 import discord
 from discord.ext import commands
 from openai import AsyncOpenAI
+from qdrant_client import QdrantClient  # pip install qdrant-client
 
-# 1. DUMMY WEB SERVER FOR RENDER FREE TIER
+# 1. WEB SERVER FOR RENDER
 app = Flask(__name__)
-
 @app.route('/')
-def home():
-    return "Bot is alive!"
+def home(): return "Bot is alive!"
+def run_flask(): threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000))), daemon=True).start()
+run_flask()
 
-def run_flask():
-    # Render automatically passes a PORT environment variable, defaults to 10000
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
-# Start the web server in a separate background thread
-threading.Thread(target=run_flask, daemon=True).start()
-
-# 2. DISCORD BOT LOGIC
+# 2. CLIENT CONFIGURATIONS
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-HF_SPACE_URL = os.getenv('HF_SPACE_URL') 
+HF_SPACE_URL = os.getenv('HF_SPACE_URL')
+QDRANT_URL = os.getenv('QDRANT_URL')        # Cloud vector DB URL
+QDRANT_API_KEY = os.getenv('QDRANT_API_KEY')  # Cloud vector DB API Key
 
-ai_client = AsyncOpenAI(
-    base_url=f"{HF_SPACE_URL}/v1", 
-    api_key="not-needed"
-)
+ai_client = AsyncOpenAI(base_url=f"{HF_SPACE_URL}/v1", api_key="not-needed")
+memory_db = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+
+# Ensure the memory collection exists in the cloud
+COLLECTION_NAME = "lucy_memories"
+try:
+    memory_db.get_collection(COLLECTION_NAME)
+except Exception:
+    # Creating a collection optimized for fast textual embeddings
+    memory_db.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config={"size": 384, "distance": "Cosine"} # Matches a standard lightweight model like all-MiniLM-L6-v2
+    )
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 ai_lock = asyncio.Lock()
 
-@bot.event
-async def on_ready():
-    print(f"Lucy is live on Render Web Service Free Tier!")
+# 3. HELPER FUNCTIONS FOR MEMORY PROCESSING
+async def get_memories(user_id: str, prompt: str) -> str:
+    """Queries the cloud vector DB for past messages from this user that match the prompt topic."""
+    try:
+        # 1. Convert prompt text to a vector using Qdrant's built-in or a local embedding pipeline
+        # (For simplicity, utilizing Qdrant fastembed or your favorite lightweight API)
+        results = memory_db.query(
+            collection_name=COLLECTION_NAME,
+            query_text=prompt,
+            query_filter={"must": [{"key": "user_id", "match": {"value": str(user_id)}}]},
+            limit=3
+        )
+        memories = [r.metadata["text"] for r in results]
+        return "\n".join(memories) if memories else "No relevant past memories found."
+    except Exception as e:
+        print(f"Memory retrieval error: {e}")
+        return ""
 
+async def save_memory(user_id: str, user_prompt: str, ai_response: str):
+    """Saves the conversation exchange into the vector database so it can be recalled later."""
+    try:
+        memory_text = f"User said: {user_prompt} | Lucy responded: {ai_response}"
+        memory_db.add(
+            collection_name=COLLECTION_NAME,
+            documents=[memory_text],
+            metadata=[{"user_id": str(user_id), "text": memory_text}]
+        )
+        print("💡 Memory successfully archived.")
+    except Exception as e:
+        print(f"Failed to save memory: {e}")
+
+# 4. DISCORD COMMAND OVERHAUL
 @bot.command(name="ai")
 async def ask_ai(ctx, *, prompt: str):
     if ai_lock.locked():
@@ -49,16 +80,32 @@ async def ask_ai(ctx, *, prompt: str):
     async with ai_lock:
         async with ctx.typing():
             try:
+                # STEP A: Retrieve relative memories for this specific user
+                past_memories = await get_memories(ctx.author.id, prompt)
+                
+                system_instruction = (
+                    "You are Lucy, a helpful and witty AI assistant. "
+                    "You have a continuous memory of past conversations. Rely heavily on the following "
+                    f"retrieved past interactions to maintain conversational continuity: \n{past_memories}"
+                )
+
+                # STEP B: Ask the Hugging Face Model
                 response = await ai_client.chat.completions.create(
                     model="local-model",
                     messages=[
-                        {"role": "system", "content": "You are Lucy, a helpful and witty AI assistant."},
+                        {"role": "system", "content": system_instruction},
                         {"role": "user", "content": prompt}
                     ],
                     max_tokens=250
                 )
                 answer = response.choices[0].message.content
+                
+                # STEP C: Reply to Discord
                 await ctx.send(answer if len(answer) <= 2000 else answer[:1990] + "...")
+                
+                # STEP D: Commit this exchange to long-term memory asynchronously
+                asyncio.create_task(save_memory(ctx.author.id, prompt, answer))
+                
             except Exception as e:
                 await ctx.send("Lucy is having trouble thinking right now.")
                 print(f"Error: {e}")
