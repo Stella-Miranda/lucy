@@ -293,48 +293,52 @@ async def on_message(message):
                 user_message_buffers[user_id] = []
             user_message_buffers[user_id].append(message.content)
 
-            # 2. If a timer is already counting down, blow it up and reset it
+            # 2. Reset the debounce timer
             if user_id in user_debounce_tasks:
                 user_debounce_tasks[user_id].cancel()
 
-            # 3. Create the delayed execution task
+            # 3. Delayed execution task
             async def delayed_trigger():
                 try:
-                    await asyncio.sleep(3.0)  # Wait for a pause in typing
+                    await asyncio.sleep(3.0)  # Wait for 3 seconds of silence
                     
-                    # Merge all accumulated lines into one clean prompt block
-                    # Format the bundled stream clearly so the LLM perceives them as sequential inputs
-                    formatted_lines = [f"- {msg}" for msg in user_message_buffers[user_id]]
-                    full_bundled_prompt = (
-                        "The user sent these messages in rapid succession:\n" + 
-                        "\n".join(formatted_lines) + 
-                        "\n\nPlease respond naturally to this entire sequence."
-                    )
+                    # Create a flat list of messages for the buffer snapshot
+                    current_buffer = list(user_message_buffers[user_id])
                     
+                    # Clear the buffer immediately for the next turn
+                    user_message_buffers.pop(user_id, None)
+                    
+                    # CRITICAL FIX: oldest_first=False to get the LATEST messages, 
+                    # then reverse them so they are in chronological order.
                     recent_messages = []
-                    # Pull past history, making sure to skip ALL messages sent during this current bundle flurry
-                    async for msg in message.channel.history(limit=12, oldest_first=True):
-                        # Skip any message that is part of the current unhandled bundle
-                        if msg.author.id == user_id and msg.content in user_message_buffers[user_id]:
+                    async for msg in message.channel.history(limit=15, oldest_first=False):
+                        # Skip messages that are part of the bundle we are currently processing
+                        if msg.author.id == user_id and msg.content in current_buffer:
                             continue
+                        
                         role = "assistant" if msg.author == bot.user else "user"
                         content = msg.content.replace("!ai ", "") if msg.content.startswith("!ai ") else msg.content
                         if content:
                             recent_messages.append({"role": role, "content": content})
+                    
+                    # Reverse because history(oldest_first=False) gives newest-to-oldest
+                    recent_messages.reverse()
 
-                    # Clear the buffer for the next conversation turn before calling the LLM
-                    user_message_buffers.pop(user_id, None)
-
-                    # Hand the entire combined prompt block over to Lucy
+                    # FOOLPROOF PROMPT STRUCTURE: Hardcode the requirement directly into the final user prompt
+                    full_bundled_prompt = (
+                        "I just sent you multiple messages in a row. You MUST answer every single part of them "
+                        "individually in your reply. Do not ignore any of them!\n\n"
+                        "My messages:\n" + "\n".join([f"- {m}" for m in current_buffer])
+                    )
+                    
                     await ask_ai(ctx, prompt=full_bundled_prompt, chat_history=recent_messages)
                     
                 except asyncio.CancelledError:
-                    pass  # Silently drop out if the user is still actively typing
+                    pass  
                 except Exception as e:
                     print(f"Error in bundle loop: {e}")
                     user_message_buffers.pop(user_id, None)
 
-            # Assign and launch the timer task
             user_debounce_tasks[user_id] = asyncio.create_task(delayed_trigger())
             return
 
