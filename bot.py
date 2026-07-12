@@ -274,81 +274,92 @@ def parse_ai_response(raw_content: str):
 # 7. DISCORD EVENT HANDLING — typing-aware bundling
 # ==============================================================================
 
-TYPING_TIMEOUT = 10   # Discord's own typing-indicator expiry window
-POST_STOP_WAIT = 3    # extra quiet time required after typing stops
+MAX_WAIT_EXTENSIONS = 2     # cap so it doesn't wait forever if they just went quiet
+EXTENSION_WAIT = 4.0        # extra wait if judged incomplete
 
-user_typing_last = {}       # user_id -> timestamp of most recent typing signal
-user_message_buffers = {}   # user_id -> list[str]
-user_watch_tasks = {}       # user_id -> asyncio.Task
-user_last_message = {}      # user_id -> most recent discord.Message (for ctx rebuild)
-
-
-def _restart_watch(user_id):
-    if user_id in user_watch_tasks:
-        user_watch_tasks[user_id].cancel()
-    user_watch_tasks[user_id] = asyncio.create_task(_watch_and_fire(user_id))
+user_debounce_tasks = {}
+user_message_buffers = {}
+user_wait_extensions = {}   # user_id -> how many times we've already extended
 
 
-async def _watch_and_fire(user_id):
+async def looks_incomplete(current_buffer) -> bool:
+    """Cheap classifier: does this bundle read like a cut-off thought
+    (trailing 'and', 'so', 'because', a half-finished list) vs a complete
+    one, even if short? False (complete) on any error, so a hiccup never
+    stalls a reply forever."""
+    check_prompt = (
+        "Below are consecutive Discord messages a user just sent, in order. "
+        "Decide if they look CUT OFF/INCOMPLETE (user likely still typing more) "
+        "or COMPLETE (a finished thought/question, even if short).\n\n"
+        "Messages:\n" + "\n".join(f"- {m}" for m in current_buffer) + "\n\n"
+        "Respond with ONLY one word: INCOMPLETE or COMPLETE."
+    )
     try:
-        # Phase 1: keep waiting as long as Discord's typing signal is still "live"
-        while True:
-            last_typing = user_typing_last.get(user_id, 0)
-            since_typing = time.time() - last_typing
-            if since_typing < TYPING_TIMEOUT:
-                await asyncio.sleep(TYPING_TIMEOUT - since_typing)
-                continue
-
-            # Phase 2: typing signal lapsed -> require POST_STOP_WAIT of true silence
-            await asyncio.sleep(POST_STOP_WAIT)
-            if time.time() - user_typing_last.get(user_id, 0) < TYPING_TIMEOUT:
-                continue  # they started typing again during the grace window
-            break
-
-        current_buffer = list(user_message_buffers.get(user_id, []))
-        user_message_buffers.pop(user_id, None)
-        if not current_buffer:
-            return
-
-        last_msg = user_last_message.get(user_id)
-        if last_msg is None:
-            return
-        ctx = await bot.get_context(last_msg)
-        channel = last_msg.channel
-
-        recent_messages = []
-        async for msg in channel.history(limit=15, oldest_first=False):
-            if msg.author.id == user_id and msg.content in current_buffer:
-                continue
-            role = "assistant" if msg.author == bot.user else "user"
-            content = msg.content.replace("!ai ", "") if msg.content.startswith("!ai ") else msg.content
-            if content:
-                recent_messages.append({"role": role, "content": content})
-        recent_messages.reverse()
-
-        full_bundled_prompt = (
-            "I just sent you multiple messages in a row. You MUST answer every single part of them "
-            "individually in your reply. Do not ignore any of them!\n\n"
-            "My messages:\n" + "\n".join([f"- {m}" for m in current_buffer])
+        response = await ai_client.chat.completions.create(
+            model="local-model",
+            messages=[{"role": "user", "content": check_prompt}],
+            max_tokens=5
         )
+        return response.choices[0].message.content.strip().upper().startswith("INCOMPLETE")
+    except Exception as e:
+        print(f"Completeness check failed, defaulting to COMPLETE: {e}")
+        return False
 
-        await ask_ai(ctx, prompt=full_bundled_prompt, chat_history=recent_messages)
 
+async def _attempt_fire(user_id, message):
+    current_buffer = list(user_message_buffers.get(user_id, []))
+    if not current_buffer:
+        return
+
+    if await looks_incomplete(current_buffer):
+        used = user_wait_extensions.get(user_id, 0)
+        if used < MAX_WAIT_EXTENSIONS:
+            user_wait_extensions[user_id] = used + 1
+            print(f"⏳ Bundle looks incomplete, extending wait ({used + 1}/{MAX_WAIT_EXTENSIONS})")
+            user_debounce_tasks[user_id] = asyncio.create_task(_delayed_retry(user_id, message))
+            return
+        print("⏳ Extension cap reached, answering anyway.")
+
+    # Committed: clear state and actually respond
+    user_wait_extensions.pop(user_id, None)
+    user_message_buffers.pop(user_id, None)
+
+    ctx = await bot.get_context(message)
+    recent_messages = []
+    async for msg in message.channel.history(limit=15, oldest_first=False):
+        if msg.author.id == user_id and msg.content in current_buffer:
+            continue
+        role = "assistant" if msg.author == bot.user else "user"
+        content = msg.content.replace("!ai ", "") if msg.content.startswith("!ai ") else msg.content
+        if content:
+            recent_messages.append({"role": role, "content": content})
+    recent_messages.reverse()
+
+    full_bundled_prompt = (
+        "I just sent you multiple messages in a row. You MUST answer every single part of them "
+        "individually in your reply. Do not ignore any of them!\n\n"
+        "My messages:\n" + "\n".join(f"- {m}" for m in current_buffer)
+    )
+    await ask_ai(ctx, prompt=full_bundled_prompt, chat_history=recent_messages)
+
+
+async def _delayed_trigger(user_id, message):
+    try:
+        await asyncio.sleep(3.0)
+        await _attempt_fire(user_id, message)
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        print(f"Error in watch loop: {e}")
+        print(f"Error in bundle loop: {e}")
         user_message_buffers.pop(user_id, None)
 
 
-@bot.event
-async def on_typing(channel, user, when):
-    if user.bot or not isinstance(channel, discord.DMChannel):
-        return
-    user_typing_last[user.id] = time.time()
-    # Only worth (re)scheduling if there's buffered content waiting to fire.
-    if user_message_buffers.get(user.id):
-        _restart_watch(user.id)
+async def _delayed_retry(user_id, message):
+    try:
+        await asyncio.sleep(EXTENSION_WAIT)
+        await _attempt_fire(user_id, message)
+    except asyncio.CancelledError:
+        pass
 
 
 @bot.event
@@ -356,17 +367,14 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    if message.guild is None:
-        if not message.content.startswith("!ai"):
-            user_id = message.author.id
+    if message.guild is None and not message.content.startswith("!ai"):
+        user_id = message.author.id
+        user_message_buffers.setdefault(user_id, []).append(message.content)
 
-            if user_id not in user_message_buffers:
-                user_message_buffers[user_id] = []
-            user_message_buffers[user_id].append(message.content)
-            user_last_message[user_id] = message
-
-            _restart_watch(user_id)
-            return
+        if user_id in user_debounce_tasks:
+            user_debounce_tasks[user_id].cancel()
+        user_debounce_tasks[user_id] = asyncio.create_task(_delayed_trigger(user_id, message))
+        return
 
     await bot.process_commands(message)
 
