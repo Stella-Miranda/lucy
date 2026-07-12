@@ -274,7 +274,9 @@ def parse_ai_response(raw_content: str):
 # ==============================================================================
 
 # Add this dictionary at the top of your script with your other configurations
+# Place these two tracking dictionaries at the top of your script
 user_debounce_tasks = {}
+user_message_buffers = {}
 
 @bot.event
 async def on_message(message):
@@ -286,29 +288,47 @@ async def on_message(message):
             ctx = await bot.get_context(message)
             user_id = message.author.id
 
-            # If there's an active waiting task for this user, cancel it
+            # 1. Append the new message to this user's text bundle
+            if user_id not in user_message_buffers:
+                user_message_buffers[user_id] = []
+            user_message_buffers[user_id].append(message.content)
+
+            # 2. If a timer is already counting down, blow it up and reset it
             if user_id in user_debounce_tasks:
                 user_debounce_tasks[user_id].cancel()
 
-            # Create a new delayed task
+            # 3. Create the delayed execution task
             async def delayed_trigger():
                 try:
-                    await asyncio.sleep(3.0)  # Wait 3 seconds for more typing
+                    await asyncio.sleep(3.0)  # Wait for a pause in typing
+                    
+                    # Merge all accumulated lines into one clean prompt block
+                    full_bundled_prompt = "\n".join(user_message_buffers[user_id])
                     
                     recent_messages = []
-                    async for msg in message.channel.history(limit=8, oldest_first=True):
+                    # Pull past history, making sure to skip ALL messages sent during this current bundle flurry
+                    async for msg in message.channel.history(limit=12, oldest_first=True):
+                        # Skip any message that is part of the current unhandled bundle
+                        if msg.author.id == user_id and msg.content in user_message_buffers[user_id]:
+                            continue
                         role = "assistant" if msg.author == bot.user else "user"
                         content = msg.content.replace("!ai ", "") if msg.content.startswith("!ai ") else msg.content
                         if content:
                             recent_messages.append({"role": role, "content": content})
 
-                    await ask_ai(ctx, prompt=message.content, chat_history=recent_messages)
-                except asyncio.CancelledError:
-                    pass # Silently exit if the user typed another message
-                finally:
-                    user_debounce_tasks.pop(user_id, None)
+                    # Clear the buffer for the next conversation turn before calling the LLM
+                    user_message_buffers.pop(user_id, None)
 
-            # Store and start the task
+                    # Hand the entire combined prompt block over to Lucy
+                    await ask_ai(ctx, prompt=full_bundled_prompt, chat_history=recent_messages)
+                    
+                except asyncio.CancelledError:
+                    pass  # Silently drop out if the user is still actively typing
+                except Exception as e:
+                    print(f"Error in bundle loop: {e}")
+                    user_message_buffers.pop(user_id, None)
+
+            # Assign and launch the timer task
             user_debounce_tasks[user_id] = asyncio.create_task(delayed_trigger())
             return
 
