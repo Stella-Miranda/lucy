@@ -270,13 +270,85 @@ def parse_ai_response(raw_content: str):
 
 
 # ==============================================================================
-# 7. DISCORD EVENT HANDLING
+# 7. DISCORD EVENT HANDLING — typing-aware bundling
 # ==============================================================================
 
-# Add this dictionary at the top of your script with your other configurations
-# Place these two tracking dictionaries at the top of your script
-user_debounce_tasks = {}
-user_message_buffers = {}
+TYPING_TIMEOUT = 10   # Discord's own typing-indicator expiry window
+POST_STOP_WAIT = 3    # extra quiet time required after typing stops
+
+user_typing_last = {}       # user_id -> timestamp of most recent typing signal
+user_message_buffers = {}   # user_id -> list[str]
+user_watch_tasks = {}       # user_id -> asyncio.Task
+user_last_message = {}      # user_id -> most recent discord.Message (for ctx rebuild)
+
+
+def _restart_watch(user_id):
+    if user_id in user_watch_tasks:
+        user_watch_tasks[user_id].cancel()
+    user_watch_tasks[user_id] = asyncio.create_task(_watch_and_fire(user_id))
+
+
+async def _watch_and_fire(user_id):
+    try:
+        # Phase 1: keep waiting as long as Discord's typing signal is still "live"
+        while True:
+            last_typing = user_typing_last.get(user_id, 0)
+            since_typing = time.time() - last_typing
+            if since_typing < TYPING_TIMEOUT:
+                await asyncio.sleep(TYPING_TIMEOUT - since_typing)
+                continue
+
+            # Phase 2: typing signal lapsed -> require POST_STOP_WAIT of true silence
+            await asyncio.sleep(POST_STOP_WAIT)
+            if time.time() - user_typing_last.get(user_id, 0) < TYPING_TIMEOUT:
+                continue  # they started typing again during the grace window
+            break
+
+        current_buffer = list(user_message_buffers.get(user_id, []))
+        user_message_buffers.pop(user_id, None)
+        if not current_buffer:
+            return
+
+        last_msg = user_last_message.get(user_id)
+        if last_msg is None:
+            return
+        ctx = await bot.get_context(last_msg)
+        channel = last_msg.channel
+
+        recent_messages = []
+        async for msg in channel.history(limit=15, oldest_first=False):
+            if msg.author.id == user_id and msg.content in current_buffer:
+                continue
+            role = "assistant" if msg.author == bot.user else "user"
+            content = msg.content.replace("!ai ", "") if msg.content.startswith("!ai ") else msg.content
+            if content:
+                recent_messages.append({"role": role, "content": content})
+        recent_messages.reverse()
+
+        full_bundled_prompt = (
+            "I just sent you multiple messages in a row. You MUST answer every single part of them "
+            "individually in your reply. Do not ignore any of them!\n\n"
+            "My messages:\n" + "\n".join([f"- {m}" for m in current_buffer])
+        )
+
+        await ask_ai(ctx, prompt=full_bundled_prompt, chat_history=recent_messages)
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"Error in watch loop: {e}")
+        user_message_buffers.pop(user_id, None)
+
+
+@bot.event
+async def on_typing(channel, user, when):
+    if user.bot or not isinstance(channel, discord.DMChannel):
+        return
+    user_typing_last[user.id] = time.time()
+    # Only worth (re)scheduling if there's buffered content waiting to fire.
+    if user_message_buffers.get(user.id):
+        _restart_watch(user.id)
+
 
 @bot.event
 async def on_message(message):
@@ -285,65 +357,17 @@ async def on_message(message):
 
     if message.guild is None:
         if not message.content.startswith("!ai"):
-            ctx = await bot.get_context(message)
             user_id = message.author.id
 
-            # 1. Append the new message to this user's text bundle
             if user_id not in user_message_buffers:
                 user_message_buffers[user_id] = []
             user_message_buffers[user_id].append(message.content)
+            user_last_message[user_id] = message
 
-            # 2. Reset the debounce timer
-            if user_id in user_debounce_tasks:
-                user_debounce_tasks[user_id].cancel()
-
-            # 3. Delayed execution task
-            async def delayed_trigger():
-                try:
-                    await asyncio.sleep(3.0)  # Wait for 3 seconds of silence
-                    
-                    # Create a flat list of messages for the buffer snapshot
-                    current_buffer = list(user_message_buffers[user_id])
-                    
-                    # Clear the buffer immediately for the next turn
-                    user_message_buffers.pop(user_id, None)
-                    
-                    # CRITICAL FIX: oldest_first=False to get the LATEST messages, 
-                    # then reverse them so they are in chronological order.
-                    recent_messages = []
-                    async for msg in message.channel.history(limit=15, oldest_first=False):
-                        # Skip messages that are part of the bundle we are currently processing
-                        if msg.author.id == user_id and msg.content in current_buffer:
-                            continue
-                        
-                        role = "assistant" if msg.author == bot.user else "user"
-                        content = msg.content.replace("!ai ", "") if msg.content.startswith("!ai ") else msg.content
-                        if content:
-                            recent_messages.append({"role": role, "content": content})
-                    
-                    # Reverse because history(oldest_first=False) gives newest-to-oldest
-                    recent_messages.reverse()
-
-                    # FOOLPROOF PROMPT STRUCTURE: Hardcode the requirement directly into the final user prompt
-                    full_bundled_prompt = (
-                        "I just sent you multiple messages in a row. You MUST answer every single part of them "
-                        "individually in your reply. Do not ignore any of them!\n\n"
-                        "My messages:\n" + "\n".join([f"- {m}" for m in current_buffer])
-                    )
-                    
-                    await ask_ai(ctx, prompt=full_bundled_prompt, chat_history=recent_messages)
-                    
-                except asyncio.CancelledError:
-                    pass  
-                except Exception as e:
-                    print(f"Error in bundle loop: {e}")
-                    user_message_buffers.pop(user_id, None)
-
-            user_debounce_tasks[user_id] = asyncio.create_task(delayed_trigger())
+            _restart_watch(user_id)
             return
 
     await bot.process_commands(message)
-
 
 @bot.command(name="ai")
 async def ask_ai(ctx, *, prompt: str, chat_history: list = None):
