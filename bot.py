@@ -54,6 +54,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True       # Enforces receiving direct messages cleanly
 intents.dm_reactions = True
+intents.dm_typing = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 ai_lock = asyncio.Lock()
 
