@@ -339,7 +339,7 @@ async def _attempt_fire(user_id, message):
     full_bundled_prompt = (
         f"Hey Lucy, I sent you a few quick thoughts back-to-back:\n\n"
         f"{messages_joined}\n\n"
-        f"Weave your answers to these together into a natural, fluid response like a normal conversation!"
+        f"Weave your answers to these together into a natural, fluid response like a normal conversation, don't make a list!"
     )
     await ask_ai(ctx, prompt=full_bundled_prompt, chat_history=recent_messages)
 
