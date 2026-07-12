@@ -83,65 +83,77 @@ async def save_memory(user_id: str, user_prompt: str, ai_response: str):
 
 
 # ==============================================================================
-# 4. DISCORD COMMAND OVERHAUL (Paste this exact block below your helper functions)
+# 4. DISCORD COMMAND OVERHAUL
 # ==============================================================================
 
 @bot.event
 async def on_message(message):
-    # Ignore messages sent by the bot itself
     if message.author == bot.user:
         return
 
-    # Check if the message is in a DM (no guild/server associated with it)
+    # Check if the message is in a DM
     if message.guild is None:
-        # Check if they forgot the prefix, and simulate the command automatically
         if not message.content.startswith("!ai"):
             ctx = await bot.get_context(message)
             ctx.command = bot.get_command("ai")
             
-            # FIX: We must explicitly pass the message content as the 'prompt' argument!
-            await bot.invoke(ctx, prompt=message.content)
+            # Fetch the last 8 messages to build recent context
+            # We use oldest_first=True so they are fed to the AI chronologically
+            recent_messages = []
+            async for msg in message.channel.history(limit=8, oldest_first=True):
+                role = "assistant" if msg.author == bot.user else "user"
+                # Strip out the command prefix if they manually typed it earlier
+                content = msg.content.replace("!ai ", "") if msg.content.startswith("!ai ") else msg.content
+                if content: # Avoid empty embed messages
+                    recent_messages.append({"role": role, "content": content})
+
+            # Hand over the context stack and current message to the AI invoker
+            await bot.invoke(ctx, prompt=message.content, chat_history=recent_messages)
             return
 
-    # Crucial: Allows regular prefix commands (!ai) to still work in servers
     await bot.process_commands(message)
 
 
 @bot.command(name="ai")
-async def ask_ai(ctx, *, prompt: str):
+async def ask_ai(ctx, *, prompt: str, chat_history: list = None):
     async with ai_lock:
         async with ctx.typing():
             try:
-                # STEP A: Retrieve relative memories for this specific user
+                # Retrieve matching vector memories using the latest prompt
                 past_memories = await get_memories(ctx.author.id, prompt)
                 
                 system_instruction = (
-                    "You are Lucy, a helpful and witty AI assistant. "
+                    "You are Lucy, a funny girl."
                     "You have a continuous memory of past conversations. Rely heavily on the following "
                     f"retrieved past interactions to maintain conversational continuity: \n{past_memories}"
                 )
 
-                # STEP B: Ask the Hugging Face Model (LoRA ready)
+                # Initialize our API payload with the core instruction
+                messages_payload = [{"role": "system", "content": system_instruction}]
+
+                if chat_history:
+                    # Append the recent rolling context from the DM channel
+                    messages_payload.extend(chat_history)
+                else:
+                    # Fallback for server mode command triggers (!ai)
+                    messages_payload.append({"role": "user", "content": prompt})
+
+                # Call the Hugging Face API
                 response = await ai_client.chat.completions.create(
                     model="local-model",
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": prompt}
-                    ],
+                    messages=messages_payload,
                     max_tokens=250
                 )
                 answer = response.choices[0].message.content
                 
-                # STEP C: Reply to Discord
                 await ctx.send(answer if len(answer) <= 2000 else answer[:1990] + "...")
                 
-                # STEP D: Commit this exchange to long-term memory asynchronously
+                # Archive the exchange into vector storage
                 asyncio.create_task(save_memory(ctx.author.id, prompt, answer))
                 
             except Exception as e:
                 await ctx.send("Lucy is having trouble thinking right now.")
                 print(f"Error: {e}")
-
 if not DISCORD_TOKEN or not HF_SPACE_URL:
     print("CRITICAL ERROR: Missing environment variables!")
     sys.exit(1)
