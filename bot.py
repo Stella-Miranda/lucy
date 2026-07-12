@@ -37,6 +37,7 @@ if not memory_db.collection_exists(COLLECTION_NAME):
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.direct_messages = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 ai_lock = asyncio.Lock()
 
@@ -59,17 +60,19 @@ async def get_memories(user_id: str, prompt: str) -> str:
         print(f"Memory retrieval error: {e}")
         return ""
 
+# ==============================================================================
+# 3. HELPER FUNCTIONS FOR MEMORY PROCESSING (Keep your existing save_memory here)
+# ==============================================================================
 async def save_memory(user_id: str, user_prompt: str, ai_response: str):
     try:
         memory_text = f"User said: {user_prompt} | Lucy responded: {ai_response}"
         
-        # upsert method parses a text document directly, embedding it in the cloud automatically
         memory_db.upsert(
             collection_name=COLLECTION_NAME,
             points=[
                 models.PointStruct(
-                    id=hash(memory_text) % 10000000, # Generate a simple numeric ID
-                    vector=memory_db.embed(memory_text)[0].tolist(), # Cloud vectorized string representation
+                    id=hash(memory_text) % 10000000, 
+                    vector=memory_db.embed(memory_text)[0].tolist(), 
                     payload={"user_id": str(user_id), "text": memory_text}
                 )
             ]
@@ -78,7 +81,32 @@ async def save_memory(user_id: str, user_prompt: str, ai_response: str):
     except Exception as e:
         print(f"Failed to save memory: {e}")
 
-# 4. DISCORD COMMAND OVERHAUL
+
+# ==============================================================================
+# 4. DISCORD COMMAND OVERHAUL (Paste this exact block below your helper functions)
+# ==============================================================================
+
+@bot.event
+async def on_message(message):
+    # Ignore messages sent by the bot itself
+    if message.author == bot.user:
+        return
+
+    # Check if the message is in a DM (no guild/server associated with it)
+    if message.guild is None:
+        # Check if they forgot the prefix, and simulate the command automatically
+        if not message.content.startswith("!ai"):
+            ctx = await bot.get_context(message)
+            ctx.command = bot.get_command("ai")
+            
+            # FIX: We must explicitly pass the message content as the 'prompt' argument!
+            await bot.invoke(ctx, prompt=message.content)
+            return
+
+    # Crucial: Allows regular prefix commands (!ai) to still work in servers
+    await bot.process_commands(message)
+
+
 @bot.command(name="ai")
 async def ask_ai(ctx, *, prompt: str):
     async with ai_lock:
