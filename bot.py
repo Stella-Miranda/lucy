@@ -52,7 +52,8 @@ for collection_name, size in [(MEMORY_COLLECTION, VECTOR_SIZE), (PROFILE_COLLECT
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.direct_messages = True
+intents.dm_messages = True       # Enforces receiving direct messages cleanly
+intents.dm_reactions = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 ai_lock = asyncio.Lock()
 
