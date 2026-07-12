@@ -81,9 +81,6 @@ async def save_memory(user_id: str, user_prompt: str, ai_response: str):
 # 4. DISCORD COMMAND OVERHAUL
 @bot.command(name="ai")
 async def ask_ai(ctx, *, prompt: str):
-    if ai_lock.locked():
-        await ctx.send("⏳ I'm currently thinking for someone else. You've been placed in the queue!")
-
     async with ai_lock:
         async with ctx.typing():
             try:
