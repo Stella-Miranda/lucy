@@ -335,10 +335,11 @@ async def _attempt_fire(user_id, message):
             recent_messages.append({"role": role, "content": content})
     recent_messages.reverse()
 
+    messages_joined = "\n".join(f"> {m}" for m in current_buffer)
     full_bundled_prompt = (
-        "I just sent you multiple messages in a row. You MUST answer every single part of them "
-        "individually in your reply. Do not ignore any of them!\n\n"
-        "My messages:\n" + "\n".join(f"- {m}" for m in current_buffer)
+        f"Hey Lucy, I sent you a few quick thoughts back-to-back:\n\n"
+        f"{messages_joined}\n\n"
+        f"Weave your answers to these together into a natural, fluid response like a normal conversation!"
     )
     await ask_ai(ctx, prompt=full_bundled_prompt, chat_history=recent_messages)
 
