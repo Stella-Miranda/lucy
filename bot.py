@@ -42,30 +42,34 @@ ai_lock = asyncio.Lock()
 
 # 3. HELPER FUNCTIONS FOR MEMORY PROCESSING
 async def get_memories(user_id: str, prompt: str) -> str:
-    """Queries the cloud vector DB for past messages from this user that match the prompt topic."""
     try:
-        # 1. Convert prompt text to a vector using Qdrant's built-in or a local embedding pipeline
-        # (For simplicity, utilizing Qdrant fastembed or your favorite lightweight API)
-        results = memory_db.query(
+        # Use search instead of query to let Qdrant's cloud handle text conversion
+        results = memory_db.search(
             collection_name=COLLECTION_NAME,
-            query_text=prompt,
+            query_vector=memory_db.embed(prompt)[0],  # Server-side embedding
             query_filter={"must": [{"key": "user_id", "match": {"value": str(user_id)}}]},
             limit=3
         )
-        memories = [r.metadata["text"] for r in results]
+        memories = [r.payload["text"] for r in results]
         return "\n".join(memories) if memories else "No relevant past memories found."
     except Exception as e:
         print(f"Memory retrieval error: {e}")
         return ""
 
 async def save_memory(user_id: str, user_prompt: str, ai_response: str):
-    """Saves the conversation exchange into the vector database so it can be recalled later."""
     try:
         memory_text = f"User said: {user_prompt} | Lucy responded: {ai_response}"
-        memory_db.add(
+        
+        # We manually structure the point so Qdrant cloud can process it seamlessly
+        memory_db.upload_points(
             collection_name=COLLECTION_NAME,
-            documents=[memory_text],
-            metadata=[{"user_id": str(user_id), "text": memory_text}]
+            points=[
+                {
+                    "id": hash(memory_text) % 10000000, # Quick unique ID
+                    "vector": memory_db.embed(memory_text)[0], # Server-side embedding
+                    "payload": {"user_id": str(user_id), "text": memory_text}
+                }
+            ]
         )
         print("💡 Memory successfully archived.")
     except Exception as e:
