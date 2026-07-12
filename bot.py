@@ -303,7 +303,13 @@ async def on_message(message):
                     await asyncio.sleep(3.0)  # Wait for a pause in typing
                     
                     # Merge all accumulated lines into one clean prompt block
-                    full_bundled_prompt = "\n".join(user_message_buffers[user_id])
+                    # Format the bundled stream clearly so the LLM perceives them as sequential inputs
+                    formatted_lines = [f"- {msg}" for msg in user_message_buffers[user_id]]
+                    full_bundled_prompt = (
+                        "The user sent these messages in rapid succession:\n" + 
+                        "\n".join(formatted_lines) + 
+                        "\n\nPlease respond naturally to this entire sequence."
+                    )
                     
                     recent_messages = []
                     # Pull past history, making sure to skip ALL messages sent during this current bundle flurry
