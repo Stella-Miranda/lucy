@@ -273,28 +273,43 @@ def parse_ai_response(raw_content: str):
 # 7. DISCORD EVENT HANDLING
 # ==============================================================================
 
+# Add this dictionary at the top of your script with your other configurations
+user_debounce_tasks = {}
+
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
 
-    # Check if the message is in a DM
     if message.guild is None:
         if not message.content.startswith("!ai"):
             ctx = await bot.get_context(message)
-            
-            recent_messages = []
-            # Grab history, but skip the very last message (the current one) 
-            # by checking the message ID so we don't duplicate it.
-            async for msg in message.channel.history(limit=8, oldest_first=True):
-                if msg.id == message.id:
-                    continue
-                role = "assistant" if msg.author == bot.user else "user"
-                content = msg.content.replace("!ai ", "") if msg.content.startswith("!ai ") else msg.content
-                if content:
-                    recent_messages.append({"role": role, "content": content})
+            user_id = message.author.id
 
-            await ask_ai(ctx, prompt=message.content, chat_history=recent_messages)
+            # If there's an active waiting task for this user, cancel it
+            if user_id in user_debounce_tasks:
+                user_debounce_tasks[user_id].cancel()
+
+            # Create a new delayed task
+            async def delayed_trigger():
+                try:
+                    await asyncio.sleep(3.0)  # Wait 3 seconds for more typing
+                    
+                    recent_messages = []
+                    async for msg in message.channel.history(limit=8, oldest_first=True):
+                        role = "assistant" if msg.author == bot.user else "user"
+                        content = msg.content.replace("!ai ", "") if msg.content.startswith("!ai ") else msg.content
+                        if content:
+                            recent_messages.append({"role": role, "content": content})
+
+                    await ask_ai(ctx, prompt=message.content, chat_history=recent_messages)
+                except asyncio.CancelledError:
+                    pass # Silently exit if the user typed another message
+                finally:
+                    user_debounce_tasks.pop(user_id, None)
+
+            # Store and start the task
+            user_debounce_tasks[user_id] = asyncio.create_task(delayed_trigger())
             return
 
     await bot.process_commands(message)
