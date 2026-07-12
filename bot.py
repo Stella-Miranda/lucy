@@ -278,11 +278,13 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
+    # Check if the message is in a DM
     if message.guild is None:
+        # If they did NOT use the prefix in a DM, intercept it and run directly
         if not message.content.startswith("!ai"):
             ctx = await bot.get_context(message)
-            ctx.command = bot.get_command("ai")
-
+            
+            # Fetch the last 8 messages to build recent rolling context
             recent_messages = []
             async for msg in message.channel.history(limit=8, oldest_first=True):
                 role = "assistant" if msg.author == bot.user else "user"
@@ -290,9 +292,11 @@ async def on_message(message):
                 if content:
                     recent_messages.append({"role": role, "content": content})
 
-            await bot.invoke(ctx, prompt=message.content, chat_history=recent_messages)
+            # Explicitly call the function directly, bypassing the prefix engine
+            await ask_ai(ctx, prompt=message.content, chat_history=recent_messages)
             return
 
+    # Process standard commands (!ai hello) in public servers
     await bot.process_commands(message)
 
 
@@ -301,6 +305,7 @@ async def ask_ai(ctx, *, prompt: str, chat_history: list = None):
     async with ai_lock:
         async with ctx.typing():
             try:
+                # 1. Gather historical data elements
                 past_memories = await get_memories(ctx.author.id, prompt)
                 profile = await get_user_profile(ctx.author.id)
 
@@ -318,13 +323,17 @@ async def ask_ai(ctx, *, prompt: str, chat_history: list = None):
                     '{"reply": "<your in-character reply to the user>", "importance": <integer 1-10>}'
                 )
 
+                # 2. Build standard chat compilation window
                 messages_payload = [{"role": "system", "content": system_instruction}]
 
                 if chat_history:
+                    # Append chronological context (including the latest message scraped at the tail end)
                     messages_payload.extend(chat_history)
                 else:
+                    # Direct standard trigger fallback
                     messages_payload.append({"role": "user", "content": prompt})
 
+                # 3. Call execution model
                 response = await ai_client.chat.completions.create(
                     model="local-model",
                     messages=messages_payload,
@@ -334,21 +343,21 @@ async def ask_ai(ctx, *, prompt: str, chat_history: list = None):
                 raw_content = response.choices[0].message.content
                 answer, importance = parse_ai_response(raw_content)
 
+                # 4. Return message down pipeline
                 await ctx.send(answer if len(answer) <= 2000 else answer[:1990] + "...")
 
-                # --- Importance gatekeeper: skip noise entirely ---
+                # 5. Pipeline Memory Storage Filters
                 if importance >= IMPORTANCE_THRESHOLD:
                     asyncio.create_task(save_memory(ctx.author.id, prompt, answer, importance))
                 else:
                     print(f"🗑️ Skipped saving low-importance exchange (importance={importance}).")
 
-                # Rolling profile always gets a look, regardless of single-message importance
+                # Profile evaluation logic loops automatically
                 asyncio.create_task(maybe_update_profile(ctx.author.id, prompt, answer))
 
             except Exception as e:
                 await ctx.send("Lucy is having trouble thinking right now.")
                 print(f"Error: {e}")
-
 
 if not DISCORD_TOKEN or not HF_SPACE_URL:
     print("CRITICAL ERROR: Missing environment variables!")
